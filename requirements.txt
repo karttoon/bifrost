@@ -1,0 +1,4 @@
+aiohttp>=3.9.0
+irc>=20.0
+slack-bolt>=1.18.0
+slack-sdk>=3.27.0

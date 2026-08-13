@@ -1,0 +1,7 @@
+bifrost_config.json
+*.pem
+*.pub
+*.log
+*.pid
+__pycache__/
+.claude/

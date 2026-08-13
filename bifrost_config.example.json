@@ -1,0 +1,27 @@
+{
+    "irc": {
+        "server": "irc.example.net",
+        "port": 6667,
+        "nick": "bifrost",
+        "channel": "#yourchannel"
+    },
+    "slack": {
+        "bot_token": "xoxb-your-bot-token",
+        "app_token": "xapp-your-app-token",
+        "channel_id": "C0XXXXXXX"
+    },
+    "discord": {
+        "bot_token": "your-discord-bot-token",
+        "channel_id": "000000000000000000",
+        "webhook_url": "https://discord.com/api/webhooks/your-webhook-url",
+        "gateway_intents": 33281
+    },
+    "bridge": {
+        "irc_tag": "[I]",
+        "slack_tag": "[S]",
+        "discord_tag": "[D]",
+        "avatar_service": "https://robohash.org/{username}?size=1024x1024",
+        "log_level": "INFO",
+        "log_file": "bifrost.log"
+    }
+}
