@@ -33,8 +33,8 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 __author__ = "Jeff White [karttoon] @noottrak"
-__version__ = "2.1.0"
-__date__ = "13AUG2026"
+__version__ = "2.2.0"
+__date__ = "20AUG2026"
 
 # ---------------------------------------------------------------------------
 # Message type shared across all threads
@@ -755,7 +755,8 @@ class BifrostBridge(object):
     HEALTH_CHECK_INTERVAL = 60
     HEALTH_LOG_INTERVAL = 300
     MAX_RESTART_DELAY = 300
-    SLACK_PROACTIVE_RESTART_HOURS = 24
+    SLACK_MAX_UPTIME = 24 * 3600
+    IRC_DISCONNECT_GRACE = 300
 
     def __init__(self, config):
         self.config = config
@@ -768,16 +769,19 @@ class BifrostBridge(object):
         self.slack_client = None
         self.discord_gw = None
 
-        # Internal handle for forced Slack restart
-        self._slack_handler = None
-
         # Threads
         self._threads = {}
 
         # Health tracking
         self._restart_counts = collections.Counter()
-        self._last_forced_slack = 0
         self._service_started = {}
+
+        # Slack restart signal — set by error monitor or health loop
+        self._slack_restart_flag = threading.Event()
+
+        # IRC restart signal — set by health loop on prolonged disconnect
+        self._irc_restart_flag = threading.Event()
+        self._irc_disconnect_since = None
 
         # Install Slack error monitor
         monitor = SlackErrorMonitor(self)
@@ -794,9 +798,13 @@ class BifrostBridge(object):
                 with self._lock:
                     self.irc_bot = bot
                 self._service_started["irc"] = time.time()
+                self._irc_disconnect_since = None
+                self._irc_restart_flag.clear()
                 delay = 15
-                bot.start()
-                self.logger.warning("IRC service exited unexpectedly")
+                bot._connect()
+                while not self._irc_restart_flag.is_set():
+                    bot.reactor.process_once(0.2)
+                self.logger.info("IRC service cycling (restart flag set)")
             except Exception:
                 self.logger.exception("IRC service crashed")
             self._restart_counts["irc"] += 1
@@ -815,16 +823,23 @@ class BifrostBridge(object):
                 app, handler, client = setup_slack(self.config, self.message_queue)
                 with self._lock:
                     self.slack_client = client
-                    self._slack_handler = handler
                 self._service_started["slack"] = time.time()
+                self._slack_restart_flag.clear()
                 delay = 15
-                handler.start()
-                self.logger.warning("Slack service exited unexpectedly")
+                handler.connect()
+                self.logger.info("Slack service connected")
+                started = time.time()
+                while not self._slack_restart_flag.is_set():
+                    if time.time() - started > self.SLACK_MAX_UPTIME:
+                        self.logger.info(
+                            "HEALTH: Proactive Slack restart (uptime %dh)",
+                            int((time.time() - started) / 3600),
+                        )
+                        break
+                    self._slack_restart_flag.wait(30)
             except Exception:
                 self.logger.exception("Slack service crashed")
             finally:
-                with self._lock:
-                    self._slack_handler = None
                 if handler:
                     try:
                         handler.close()
@@ -874,19 +889,11 @@ class BifrostBridge(object):
     # -- Forced restart -------------------------------------------------------
 
     def force_restart_slack(self):
-        """Force a Slack reconnection by closing the current handler."""
-        now = time.time()
-        if now - self._last_forced_slack < 120:
+        """Force a Slack reconnection by signaling the Slack thread."""
+        if self._slack_restart_flag.is_set():
             return
-        self._last_forced_slack = now
-        with self._lock:
-            handler = self._slack_handler
-        if handler:
-            self.logger.warning("HEALTH: Forcing Slack reconnection (error-rate trigger)")
-            try:
-                handler.close()
-            except Exception:
-                pass
+        self.logger.warning("HEALTH: Forcing Slack reconnection (error-rate trigger)")
+        self._slack_restart_flag.set()
 
     # -- Start and health loop ------------------------------------------------
 
@@ -931,20 +938,30 @@ class BifrostBridge(object):
                         t.start()
                         self._threads[name] = t
 
+                # IRC connection health — detect stale disconnects
+                bot = self.irc_bot
+                if bot is not None:
+                    try:
+                        connected = bot.connection.is_connected()
+                    except Exception:
+                        connected = False
+                    if not connected:
+                        if self._irc_disconnect_since is None:
+                            self._irc_disconnect_since = now
+                        elif now - self._irc_disconnect_since > self.IRC_DISCONNECT_GRACE:
+                            self.logger.warning(
+                                "HEALTH: IRC disconnected >%ds, forcing restart",
+                                self.IRC_DISCONNECT_GRACE,
+                            )
+                            self._irc_disconnect_since = None
+                            self._irc_restart_flag.set()
+                    else:
+                        self._irc_disconnect_since = None
+
                 # Periodic full status log
                 if now - last_full_log >= self.HEALTH_LOG_INTERVAL:
                     last_full_log = now
                     self._log_health_status()
-
-                # Proactive Slack restart after N hours as a safety valve
-                slack_started = self._service_started.get("slack", now)
-                max_age = self.SLACK_PROACTIVE_RESTART_HOURS * 3600
-                if now - slack_started > max_age:
-                    self.logger.info(
-                        "HEALTH: Proactive Slack restart (uptime %dh)",
-                        int((now - slack_started) / 3600),
-                    )
-                    self.force_restart_slack()
 
         except KeyboardInterrupt:
             self.logger.info("Shutting down Bifrost...")
@@ -964,7 +981,14 @@ class BifrostBridge(object):
                 hours = int(elapsed / 3600)
                 mins = int((elapsed % 3600) / 60)
                 uptime_str = " {}h{}m".format(hours, mins)
-            parts.append("{}={}{} r={}".format(name, alive, uptime_str, restarts))
+            extra = ""
+            if name == "irc" and self.irc_bot is not None:
+                try:
+                    if not self.irc_bot.connection.is_connected():
+                        extra = " DISCONNECTED"
+                except Exception:
+                    extra = " DISCONNECTED"
+            parts.append("{}={}{}{} r={}".format(name, alive, uptime_str, extra, restarts))
         self.logger.info("HEALTH: %s", " | ".join(parts))
 
 # ---------------------------------------------------------------------------
