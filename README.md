@@ -13,6 +13,7 @@ Bifrost is the evolution of [slackIRCbridge](https://github.com/karttoon/slackIR
 - **Health monitoring** — Periodic liveness checks with status logging every 5 minutes
 - **Slack Socket Mode watchdog** — Detects the Slack WebSocket death spiral (SSL/broken-pipe errors) and forces a clean reconnection
 - **Proactive Slack restart** — Safety valve that cycles the Slack connection every 24 hours to prevent long-running degradation
+- **Thread leak protection** — Aggressive cleanup of Slack Socket Mode internal threads on reconnect, with process self-restart if thread count exceeds safe limits
 - **Discord send fallback** — If the Discord Gateway loop goes down, messages are still delivered via a synchronous webhook POST
 - **Rotating log files** — 5MB log rotation with 3 backups
 
@@ -109,12 +110,12 @@ Fill in `bifrost_config.json`:
 Bifrost logs a health status line every 5 minutes:
 
 ```
-HEALTH: irc=UP 12h30m r=0 | slack=UP 2h15m r=1 | discord=UP 12h30m r=0 | dispatcher=UP r=0
+HEALTH: irc=UP 12h30m r=0 | slack=UP 2h15m r=1 | discord=UP 12h30m r=0 | dispatcher=UP r=0 | threads=10
 ```
 
-Each entry shows: service name, status (UP/DOWN), uptime since last restart, and total restart count (`r=`).
+Each entry shows: service name, status (UP/DOWN), uptime since last restart, total restart count (`r=`), and the current process thread count.
 
-If a service thread crashes, it is automatically restarted with exponential backoff (15s to 5min max). If the Slack Socket Mode connection enters a death spiral (20+ errors in 5 minutes), the watchdog forces a clean reconnection.
+If a service thread crashes, it is automatically restarted with exponential backoff (15s to 5min max). If the Slack Socket Mode connection enters a death spiral (20+ errors in 5 minutes), the watchdog forces a clean reconnection. If the process thread count exceeds the safety limit (default 100), the process restarts itself to reclaim leaked resources.
 
 ## Architecture
 

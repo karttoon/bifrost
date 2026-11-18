@@ -33,8 +33,8 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 __author__ = "Jeff White [karttoon] @noottrak"
-__version__ = "2.2.0"
-__date__ = "20AUG2026"
+__version__ = "2.3.0"
+__date__ = "17NOV2026"
 
 # ---------------------------------------------------------------------------
 # Message type shared across all threads
@@ -757,6 +757,7 @@ class BifrostBridge(object):
     MAX_RESTART_DELAY = 300
     SLACK_MAX_UPTIME = 24 * 3600
     IRC_DISCONNECT_GRACE = 300
+    PROCESS_THREAD_LIMIT = 100
 
     def __init__(self, config):
         self.config = config
@@ -787,6 +788,50 @@ class BifrostBridge(object):
         monitor = SlackErrorMonitor(self)
         for lib_name in ("slack_bolt", "slack_sdk"):
             logging.getLogger(lib_name).addHandler(monitor)
+
+    # -- Cleanup and self-restart ---------------------------------------------
+
+    def _cleanup_slack_handler(self, handler):
+        """Aggressively clean up SocketModeHandler to prevent thread leaks."""
+        if handler is None:
+            return
+        client = getattr(handler, "client", None)
+        if client is not None:
+            client.closed = True
+            for attr in ("current_session_runner", "message_processor"):
+                runner = getattr(client, attr, None)
+                if runner is not None:
+                    try:
+                        runner.shutdown_flag = True
+                    except Exception:
+                        pass
+            for runner in getattr(client, "message_listeners", []):
+                try:
+                    runner.shutdown_flag = True
+                except Exception:
+                    pass
+            for ws_attr in ("wss", "ws"):
+                ws = getattr(client, ws_attr, None)
+                if ws is not None:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                    break
+        try:
+            handler.close()
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    def _self_restart(self, reason):
+        """Restart the entire process to reclaim leaked resources."""
+        self.logger.warning("SELF-RESTART: %s", reason)
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception:
+            self.logger.exception("SELF-RESTART: os.execv failed, exiting")
+            os._exit(1)
 
     # -- Service runners (each loops forever, restarting on crash) -----------
 
@@ -840,11 +885,7 @@ class BifrostBridge(object):
             except Exception:
                 self.logger.exception("Slack service crashed")
             finally:
-                if handler:
-                    try:
-                        handler.close()
-                    except Exception:
-                        pass
+                self._cleanup_slack_handler(handler)
             self._restart_counts["slack"] += 1
             self.logger.info(
                 "HEALTH: Slack restarting in %ds (restart #%d)",
@@ -958,6 +999,15 @@ class BifrostBridge(object):
                     else:
                         self._irc_disconnect_since = None
 
+                # Thread count safety valve
+                thread_count = threading.active_count()
+                if thread_count > self.PROCESS_THREAD_LIMIT:
+                    self._self_restart(
+                        "Thread count {} exceeds limit {}".format(
+                            thread_count, self.PROCESS_THREAD_LIMIT
+                        )
+                    )
+
                 # Periodic full status log
                 if now - last_full_log >= self.HEALTH_LOG_INTERVAL:
                     last_full_log = now
@@ -989,7 +1039,9 @@ class BifrostBridge(object):
                 except Exception:
                     extra = " DISCONNECTED"
             parts.append("{}={}{}{} r={}".format(name, alive, uptime_str, extra, restarts))
-        self.logger.info("HEALTH: %s", " | ".join(parts))
+        self.logger.info(
+            "HEALTH: %s | threads=%d", " | ".join(parts), threading.active_count()
+        )
 
 # ---------------------------------------------------------------------------
 # Main
